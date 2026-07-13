@@ -14,32 +14,82 @@ from typing import Any, Callable
 from cpa_schema import DEFAULT_BASE_URL, build_cpa_xai_auth, credential_file_name
 from cpa_writer import write_cpa_xai_auth
 
-def _push_to_remote(file_path: Path, base_url: str, api_key: str, log: Callable) -> None:
-    """将 xai-*.json 推送到远程 CLIProxyAPI。"""
+def _push_to_remote(
+    file_path: Path,
+    base_url: str,
+    api_key: str,
+    log: Callable,
+    *,
+    retries: int = 3,
+    timeout: float = 30.0,
+) -> dict:
+    """Push xai-*.json to remote CLIProxyAPI with retries.
+
+    Returns {ok, attempts, error?, url?, name}.
+    """
     import json as _json
-    import urllib.request
     import urllib.error
+    import urllib.request
 
-    url = f"{base_url.rstrip('/')}/v0/management/auth-files?name={file_path.name}"
-    content = file_path.read_text(encoding="utf-8")
-    data = content.encode("utf-8")
+    name = file_path.name
+    url = f"{base_url.rstrip('/')}/v0/management/auth-files?name={name}"
+    data = file_path.read_bytes()
+    attempts = max(1, int(retries or 1))
+    last_err = ""
 
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "GrokX/1.0",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = _json.loads(resp.read().decode("utf-8"))
-    if result.get("status") == "ok":
-        log(f"[cpa] 已推送到远程 CPA: {url.split('?')[0]} ({file_path.name})")
-    else:
-        raise Exception(f"远程 CPA 返回: {result}")
+    for i in range(1, attempts + 1):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "GrokX/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                result = _json.loads(body) if body.strip() else {}
+            if result.get("status") == "ok":
+                log(
+                    f"[cpa] 已推送到远程 CPA: {url.split('?')[0]} "
+                    f"({name}) attempt={i}/{attempts}"
+                )
+                return {
+                    "ok": True,
+                    "attempts": i,
+                    "url": url.split("?")[0],
+                    "name": name,
+                }
+            last_err = f"远程 CPA 返回: {result}"
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                detail = ""
+            last_err = f"HTTP {exc.code}: {detail or exc.reason}"
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"{type(exc).__name__}: {exc}"
+
+        if i < attempts:
+            wait = min(8.0, 1.0 * i)
+            log(
+                f"[cpa] 推送失败 attempt={i}/{attempts} ({name}): {last_err} "
+                f"→ {wait:.0f}s 后重试"
+            )
+            time.sleep(wait)
+        else:
+            log(f"[cpa] 推送到远程 CPA 失败 ({name}) after {attempts} attempts: {last_err}")
+
+    return {
+        "ok": False,
+        "attempts": attempts,
+        "error": last_err or "push failed",
+        "url": url.split("?")[0],
+        "name": name,
+    }
 
 
 ROOT = Path(__file__).resolve().parent
@@ -272,17 +322,37 @@ def export_cpa_from_sso(
 
     log(f"[cpa] wrote {path.name} → {path}")
 
+    push_info: dict[str, Any] = {"ok": False, "skipped": True, "reason": "disabled"}
     # 推送到远程 CPA (CLIProxyAPI)
     if cfg.get("cpa_push_enabled", False):
         push_base = str(cfg.get("cpa_push_base_url", "") or "").strip().rstrip("/")
         push_key = str(cfg.get("cpa_push_api_key", "") or "").strip()
         if push_base and push_key:
             try:
-                _push_to_remote(path, push_base, push_key, log)
-            except Exception as exc:
-                log(f"[cpa] 推送到远程 CPA 失败: {exc}")
+                retries = int(cfg.get("cpa_push_retries", 3) or 3)
+            except (TypeError, ValueError):
+                retries = 3
+            try:
+                push_timeout = float(cfg.get("cpa_push_timeout_sec", 30) or 30)
+            except (TypeError, ValueError):
+                push_timeout = 30.0
+            push_info = _push_to_remote(
+                path,
+                push_base,
+                push_key,
+                log,
+                retries=max(1, retries),
+                timeout=max(5.0, push_timeout),
+            )
         else:
+            push_info = {
+                "ok": False,
+                "skipped": True,
+                "reason": "missing cpa_push_base_url/cpa_push_api_key",
+            }
             log("[cpa] cpa_push_base_url/cpa_push_api_key 未配置，跳过推送")
+    else:
+        log("[cpa] push disabled, skip remote upload")
 
     return {
         "ok": True,
@@ -291,6 +361,8 @@ def export_cpa_from_sso(
         "filename": path.name,
         "sub": payload.get("sub"),
         "payload": payload,
+        "cpa_push_ok": bool(push_info.get("ok")),
+        "cpa_push": push_info,
     }
 
 

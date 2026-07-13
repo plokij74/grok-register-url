@@ -428,6 +428,7 @@ def _register_one_with_proxy(
         "error": str(err) if err else None,
         "cpa_path": None,
         "cpa_ok": False,
+        "cpa_push_ok": False,
     }
     if sso:
         out["sso"] = sso
@@ -461,8 +462,19 @@ def _register_one_with_proxy(
             out["cpa_ok"] = bool(cpa.get("ok"))
             out["cpa_path"] = cpa.get("path")
             out["cpa_error"] = cpa.get("error")
+            out["cpa_push_ok"] = bool(cpa.get("cpa_push_ok"))
+            out["cpa_push"] = cpa.get("cpa_push")
             if cpa.get("ok"):
                 log(f"[+] CPA {cpa.get('filename')} → {cpa.get('path')}")
+                if cpa.get("cpa_push_ok"):
+                    log(f"[+] CPA push ok ({cpa.get('filename')})")
+                elif (cpa.get("cpa_push") or {}).get("skipped"):
+                    log(f"[*] CPA push skipped: {(cpa.get('cpa_push') or {}).get('reason')}")
+                else:
+                    log(
+                        f"[!] CPA push failed: "
+                        f"{(cpa.get('cpa_push') or {}).get('error') or 'unknown'}"
+                    )
             else:
                 log(f"[!] CPA mint deferred: {cpa.get('error') or 'unknown'}")
         elif not sso:
@@ -763,42 +775,50 @@ def run_batch(
         log("[*] 代理: 关（直连）")
 
     log(
-        f"[*] 批量多开: count={count} | 并发浏览器/worker={threads} "
+        f"[*] 批量多开: 目标成功数={count} | 并发浏览器/worker={threads} "
         f"| backend={cfg.get('browser_backend') or 'local'} "
         f"| 复用窗口={bool(cfg.get('turnstile_browser_reuse', True))}"
     )
+    log("[*] 计数规则: 仅成功注册计入目标；失败会重试，不消耗成功名额")
     if threads <= 1:
         log(
             "[!] 当前并发=1，同一时间只会开 1 个浏览器拿 Turnstile。"
             "要批量多开请把「并发」调到 2+（与上个项目「并发线程」相同）。"
         )
 
+    # count = target SUCCESS accounts (not attempts).
+    # Failures do not consume the remaining quota.
     ok = 0
     fail = 0
+    attempts = 0
     results: list[dict] = []
     results_lock = threading.Lock()
-    next_idx = [0]
-    idx_lock = threading.Lock()
-
-    def claim() -> int | None:
-        with idx_lock:
-            if should_stop():
-                return None
-            if next_idx[0] >= count:
-                return None
-            i = next_idx[0]
-            next_idx[0] += 1
-            return i
+    # hard safety cap so endless Turnstile failures cannot run forever
+    try:
+        max_attempts = int(cfg.get("register_max_attempts") or 0)
+    except (TypeError, ValueError):
+        max_attempts = 0
+    if max_attempts <= 0:
+        # default: allow up to 20x target attempts, at least target+50
+        max_attempts = max(count * 20, count + 50)
 
     def worker(worker_id: int) -> None:
-        nonlocal ok, fail
+        nonlocal ok, fail, attempts
         while True:
             if should_stop():
                 break
-            i = claim()
-            if i is None:
-                break
-            log(f"\n======== account {i + 1}/{count} (worker {worker_id}) ========")
+            with results_lock:
+                if ok >= count:
+                    return
+                if attempts >= max_attempts:
+                    return
+                attempts += 1
+                attempt_no = attempts
+                success_so_far = ok
+            log(
+                f"\n======== attempt {attempt_no}/{max_attempts} "
+                f"ok={success_so_far}/{count} (worker {worker_id}) ========"
+            )
             try:
                 res = register_one(
                     cfg, log=log, worker_id=worker_id, proxy_pool=pool
@@ -817,18 +837,28 @@ def run_batch(
                                 "password": res.get("password"),
                                 "cpa_ok": res.get("cpa_ok"),
                                 "cpa_path": res.get("cpa_path"),
+                                "cpa_push_ok": res.get("cpa_push_ok"),
                                 "proxy": res.get("proxy") or None,
                             },
                             ensure_ascii=False,
                         )
                     )
+                    log(f"[+] progress ok={ok}/{count} fail={fail} attempts={attempts}")
                 else:
                     fail += 1
+                    log(
+                        f"[*] progress ok={ok}/{count} fail={fail} "
+                        f"attempts={attempts} (failure does not reduce target)"
+                    )
             if on_result is not None:
                 try:
                     on_result(res)
                 except Exception:
                     pass
+            # stop extra workers quickly once target reached
+            with results_lock:
+                if ok >= count or attempts >= max_attempts:
+                    return
 
     workers: list[threading.Thread] = []
     for wid in range(threads):
@@ -841,8 +871,16 @@ def run_batch(
         t.join()
 
     _cleanup_browsers(cfg, log=log)
-    log(f"\ndone ok={ok} fail={fail} total={count} | 并发={threads}")
-    return 0 if ok == count else 1
+    log(
+        f"\ndone ok={ok}/{count} fail={fail} attempts={attempts} "
+        f"max_attempts={max_attempts} | 并发={threads}"
+    )
+    if attempts >= max_attempts and ok < count:
+        log(
+            f"[!] 已达尝试上限 max_attempts={max_attempts}，"
+            f"成功 {ok}/{count}。可用 config.register_max_attempts 调整。"
+        )
+    return 0 if ok >= count else 1
 
 
 def main(argv: list[str] | None = None) -> int:
