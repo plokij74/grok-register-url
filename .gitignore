@@ -1,0 +1,22 @@
+# 敏感文件
+config.json
+accounts.json
+proxies.txt
+proxy_blacklist.json
+
+# CPA 导出
+cpa_auths/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# 环境变量
+.env
+.env.*
+
+# 日志
+*.log
