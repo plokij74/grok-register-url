@@ -13,9 +13,26 @@ fi
 LOG_FILE="${GROKX_LOG_FILE:-register.log}"
 # tee console + file; keep interactive stdin for --cli menu
 export PYTHONUNBUFFERED=1
+# Roxy backend module lives next to this script (browser_backend.py)
+export GROKX_BROWSER_BACKEND_DIR="${GROKX_BROWSER_BACKEND_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 
 echo "Starting GrokX protocol registration (console + $LOG_FILE)..."
 echo "==== $(date '+%F %T') start pid=$$ ====" >> "$LOG_FILE"
+
+# Multiport auto-probe is OFF by default — choose in CLI menu:
+#   1=Clash单代理  2=多代理池(可现场测活)  3=直连
+# Force pre-start multiport: GROKX_MULTIPORT_ON_START=1 ./start.sh
+if [ "${GROKX_SKIP_MULTIPORT:-0}" != "1" ] && [ "${GROKX_MULTIPORT_ON_START:-0}" = "1" ]; then
+    if [ -x "./flclash_multiport.sh" ]; then
+        echo "[*] FlClash multiport: regen + probe live nodes → proxies.txt"
+        if ./flclash_multiport.sh start; then
+            LIVE_N=$(grep -cE '^[[:space:]]*http://' proxies.txt 2>/dev/null || echo 0)
+            echo "[*] proxies.txt live count: $LIVE_N"
+        else
+            echo "[!] multiport probe failed (continue with existing proxies.txt)"
+        fi
+    fi
+fi
 
 if [ $# -eq 0 ]; then
     set -- --cli

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import string
 import sys
@@ -567,31 +568,99 @@ def interactive_menu(cfg: dict, config_path: Path) -> dict:
         + ("Roxy 指纹浏览器" if selected == "roxy" else "本地 Chrome")
     )
 
-    # 2) proxy on/off
-    default_proxy_label = "Y=走代理" if use_proxy else "N=不走代理"
-    raw_proxy = _ask(
-        f"是否走代理（Y=走代理 / N=直连，直接回车={default_proxy_label}）: "
-    ).lower()
-    if raw_proxy in ("", "default"):
-        pass
-    elif raw_proxy in ("y", "yes", "1", "是", "true", "on"):
-        use_proxy = True
-    elif raw_proxy in ("n", "no", "0", "否", "false", "off"):
-        use_proxy = False
+    # 2) proxy mode: Clash 单代理 / 多代理池 / 直连
+    cur_mode = str(cfg.get("proxy_mode") or "").strip().lower()
+    if not cfg.get("use_proxy", True):
+        cur_mode = "direct"
+    elif cur_mode in ("clash", "single", "flclash", "local", "1"):
+        cur_mode = "clash"
+    elif cur_mode in ("multi", "pool", "multiport", "proxies", "2"):
+        cur_mode = "multi"
+    elif cur_mode in ("direct", "off", "none", "3"):
+        cur_mode = "direct"
     else:
-        print("[!] 代理选择无效，请输入 Y 或 N")
+        # auto → prefer multi if proxies.txt has >1 live line, else clash
+        cur_mode = "multi" if len(pool) > 1 else ("clash" if use_proxy else "direct")
+
+    mode_label = {
+        "clash": "1=Clash单代理",
+        "multi": "2=多代理池",
+        "direct": "3=直连",
+    }.get(cur_mode, "1=Clash单代理")
+    raw_mode = _ask(
+        "请选择代理模式（"
+        "1=Clash单代理 / 2=多代理池(proxies.txt) / 3=直连，"
+        f"直接回车={mode_label}）: "
+    ).lower()
+    if raw_mode in ("", "default"):
+        proxy_mode = cur_mode
+    elif raw_mode in ("1", "clash", "single", "flclash", "local", "c"):
+        proxy_mode = "clash"
+    elif raw_mode in ("2", "multi", "pool", "multiport", "proxies", "m"):
+        proxy_mode = "multi"
+    elif raw_mode in ("3", "direct", "off", "none", "n", "0"):
+        proxy_mode = "direct"
+    else:
+        print("[!] 代理模式无效，请输入 1 / 2 / 3")
         raise SystemExit(2)
+
+    cfg["proxy_mode"] = proxy_mode
+    use_proxy = proxy_mode != "direct"
     cfg["use_proxy"] = use_proxy
 
-    if use_proxy:
-        # Roxy: same as reference — ask whether to use Roxy IP manager
+    if proxy_mode == "direct":
+        cfg["roxy_use_proxy_manager"] = False
+        print("[*] 代理模式: 直连（HTTP 注册 + Turnstile 均不挂代理）")
+    elif proxy_mode == "clash":
+        cfg["roxy_use_proxy_manager"] = False
+        cur = str(cfg.get("proxy") or "http://127.0.0.1:7890").strip()
+        raw_url = _ask(
+            f"Clash/本地单代理地址（直接回车=保留 "
+            f"{px.proxy_log_label(cur) if cur else 'http://127.0.0.1:7890'}）: "
+        )
+        if raw_url:
+            cfg["proxy"] = raw_url.strip()
+        elif not str(cfg.get("proxy") or "").strip():
+            cfg["proxy"] = "http://127.0.0.1:7890"
+        px.bind_config(cfg)
+        pool = px.load_proxy_pool(cfg, log=print)
+        print(
+            f"[*] 代理模式: Clash 单代理 → "
+            f"{px.proxy_log_label(pool[0]) if pool else '(空)'}"
+        )
+        if not pool:
+            print("[!] config.proxy 为空，注册可能失败")
+    else:
+        # multi pool
+        cfg["roxy_use_proxy_manager"] = False
+        # optional: refresh FlClash multiport → proxies.txt
+        multiport_sh = Path(__file__).resolve().parent / "flclash_multiport.sh"
+        if multiport_sh.is_file() and os.access(multiport_sh, os.X_OK):
+            raw_mp = _ask(
+                "是否刷新多代理（FlClash 测活写入 proxies.txt）"
+                "（Y=刷新 / N=用现有 proxies.txt，直接回车=N）: "
+            ).lower()
+            if raw_mp in ("y", "yes", "1", "是", "true", "on"):
+                print("[*] 正在测活多端口节点 → proxies.txt …")
+                try:
+                    import subprocess
+
+                    rc = subprocess.call(
+                        [str(multiport_sh), "start"],
+                        cwd=str(multiport_sh.parent),
+                    )
+                    if rc != 0:
+                        print(f"[!] multiport 退出码 {rc}，将继续用现有 proxies.txt")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[!] 启动 multiport 失败: {exc}")
+
+        # optional Roxy manager only in multi + roxy browser
         if selected == "roxy":
-            current_use_mgr = bool(cfg.get("roxy_use_proxy_manager", True))
+            current_use_mgr = bool(cfg.get("roxy_use_proxy_manager", False))
             default_mgr_label = "Y=使用" if current_use_mgr else "N=不使用"
             raw_mgr = _ask(
-                "是否使用指纹浏览器（Roxy）里的代理 IP"
-                f"（Y=使用 / N=不使用，走本地 proxies.txt 或 proxy，"
-                f"直接回车={default_mgr_label}）: "
+                "是否改用 Roxy 代理管理（一般选 N，用 proxies.txt）"
+                f"（Y=Roxy / N=proxies.txt，直接回车={default_mgr_label}）: "
             ).lower()
             if raw_mgr in ("", "default"):
                 use_mgr = current_use_mgr
@@ -600,23 +669,19 @@ def interactive_menu(cfg: dict, config_path: Path) -> dict:
             elif raw_mgr in ("n", "no", "0", "否", "false", "off"):
                 use_mgr = False
             else:
-                print("[!] 代理选择无效，请输入 Y 或 N")
+                print("[!] 选择无效，请输入 Y 或 N")
                 raise SystemExit(2)
             cfg["roxy_use_proxy_manager"] = use_mgr
             if use_mgr:
-                print("[*] 代理来源: Roxy IP 代理管理（池空则回退本地）")
+                print("[*] 多代理来源: Roxy IP 管理（池空则回退 proxies.txt / proxy）")
             else:
-                print("[*] 代理来源: 本地 proxies.txt / config.proxy（不读 Roxy 代理管理）")
+                print("[*] 多代理来源: proxies.txt / config.proxies")
         else:
-            # local Chrome does not read Roxy proxy manager
-            if bool(cfg.get("roxy_use_proxy_manager", False)):
-                cfg["roxy_use_proxy_manager"] = False
-            print("[*] 代理来源: proxies 列表 / proxies.txt / config.proxy")
+            print("[*] 多代理来源: proxies.txt / config.proxies")
 
-        # optional override single fallback proxy
         cur = str(cfg.get("proxy") or "").strip()
         raw_url = _ask(
-            f"回退代理地址 proxy（直接回车=保留 "
+            f"回退单代理 proxy（池空时用，直接回车=保留 "
             f"{px.proxy_log_label(cur) if cur else '(空)'}）: "
         )
         if raw_url:
@@ -626,13 +691,11 @@ def interactive_menu(cfg: dict, config_path: Path) -> dict:
         pool = px.load_proxy_pool(cfg, log=print)
         if pool:
             print(
-                f"[*] 当前代理池: {len(pool)} 条 | 示例: {px.proxy_log_label(pool[0])}"
+                f"[*] 代理模式: 多代理池 | {len(pool)} 条 | "
+                f"示例: {px.proxy_log_label(pool[0])}"
             )
         else:
-            print("[!] 当前代理池为空，注册将直连")
-    else:
-        cfg["roxy_use_proxy_manager"] = False
-        print("[*] 代理: 直连（HTTP 注册 + Turnstile 浏览器均不挂代理）")
+            print("[!] 多代理池为空，将回退/直连（请先填 proxies.txt 或跑 multiport）")
 
     # 3) register count
     raw_count = _ask(f"请输入注册数量（直接回车={default_count}）: ")
@@ -693,7 +756,11 @@ def _cleanup_browsers(cfg: dict, log=print) -> None:
 
         n = release_all_browsers(log=log)
         if n:
-            log(f"[*] Turnstile 浏览器收尾：关闭 {n} 个 worker 窗口")
+            pages = int(cfg.get("browser_pages_per_window") or 3)
+            log(
+                f"[*] Turnstile 浏览器收尾：关闭 {n} 个窗口"
+                f"（每窗最多 {pages} 标签）"
+            )
     except Exception as exc:  # noqa: BLE001
         log(f"[!] Turnstile 浏览器收尾失败: {exc}")
 
@@ -774,50 +841,88 @@ def run_batch(
     else:
         log("[*] 代理: 关（直连）")
 
+    try:
+        pages_per = max(1, int(cfg.get("browser_pages_per_window") or 3))
+    except (TypeError, ValueError):
+        pages_per = 3
+    browser_windows = (threads + pages_per - 1) // pages_per
     log(
-        f"[*] 批量多开: 目标成功数={count} | 并发浏览器/worker={threads} "
+        f"[*] 批量多开: 目标成功数={count} | 并发 worker={threads} "
+        f"| 浏览器窗口≈{browser_windows}（每窗 {pages_per} 标签） "
         f"| backend={cfg.get('browser_backend') or 'local'} "
         f"| 复用窗口={bool(cfg.get('turnstile_browser_reuse', True))}"
     )
-    log("[*] 计数规则: 仅成功注册计入目标；失败会重试，不消耗成功名额")
+    log(
+        "[*] 计数规则: 仅成功注册计入目标；"
+        "Turnstile 失败不消耗尝试上限，会一直补到成功数"
+    )
+    log(
+        f"[*] Turnstile 映射: worker_id → 窗口=worker//{pages_per} "
+        f"标签=worker%{pages_per}（过 CF 用对应标签页）"
+    )
     if threads <= 1:
         log(
-            "[!] 当前并发=1，同一时间只会开 1 个浏览器拿 Turnstile。"
+            "[!] 当前并发=1，同一时间只会用 1 个标签页拿 Turnstile。"
             "要批量多开请把「并发」调到 2+（与上个项目「并发线程」相同）。"
         )
 
     # count = target SUCCESS accounts (not attempts).
-    # Failures do not consume the remaining quota.
+    # Turnstile failures never consume max_attempts budget.
     ok = 0
     fail = 0
-    attempts = 0
+    ts_fail = 0
+    attempts = 0          # total tries (display only)
+    counted_attempts = 0  # non-turnstile tries that can hit max_attempts
     results: list[dict] = []
     results_lock = threading.Lock()
-    # hard safety cap so endless Turnstile failures cannot run forever
+
     try:
         max_attempts = int(cfg.get("register_max_attempts") or 0)
     except (TypeError, ValueError):
         max_attempts = 0
     if max_attempts <= 0:
-        # default: allow up to 20x target attempts, at least target+50
-        max_attempts = max(count * 20, count + 50)
+        # 0 / unset = unlimited for non-turnstile counted attempts too
+        max_attempts = 0
+
+    def _is_turnstile_failure(res: dict) -> bool:
+        if res.get("ok"):
+            return False
+        blob = " ".join(
+            str(x or "")
+            for x in (
+                res.get("error"),
+                res.get("result_message"),
+                res.get("result_status"),
+            )
+        ).lower()
+        keys = (
+            "turnstile",
+            "cf-turnstile",
+            "failed to verify cloudflare",
+            "no turnstile token",
+            "cloudflare turnstile",
+        )
+        return any(k in blob for k in keys)
 
     def worker(worker_id: int) -> None:
-        nonlocal ok, fail, attempts
+        nonlocal ok, fail, ts_fail, attempts, counted_attempts
         while True:
             if should_stop():
                 break
             with results_lock:
                 if ok >= count:
                     return
-                if attempts >= max_attempts:
+                if max_attempts > 0 and counted_attempts >= max_attempts:
                     return
                 attempts += 1
                 attempt_no = attempts
                 success_so_far = ok
+            cap = str(max_attempts) if max_attempts > 0 else "∞"
             log(
-                f"\n======== attempt {attempt_no}/{max_attempts} "
-                f"ok={success_so_far}/{count} (worker {worker_id}) ========"
+                f"\n======== attempt {attempt_no} "
+                f"ok={success_so_far}/{count} "
+                f"counted={counted_attempts}/{cap} "
+                f"(worker {worker_id}) ========"
             )
             try:
                 res = register_one(
@@ -826,6 +931,7 @@ def run_batch(
             except Exception as exc:  # noqa: BLE001
                 res = {"ok": False, "error": str(exc)}
                 log(f"[!] register failed: {exc}")
+            ts_hit = _is_turnstile_failure(res)
             with results_lock:
                 results.append(res)
                 if res.get("ok"):
@@ -843,21 +949,36 @@ def run_batch(
                             ensure_ascii=False,
                         )
                     )
-                    log(f"[+] progress ok={ok}/{count} fail={fail} attempts={attempts}")
+                    log(
+                        f"[+] progress ok={ok}/{count} fail={fail} "
+                        f"ts_fail={ts_fail} attempts={attempts}"
+                    )
                 else:
                     fail += 1
-                    log(
-                        f"[*] progress ok={ok}/{count} fail={fail} "
-                        f"attempts={attempts} (failure does not reduce target)"
-                    )
+                    if ts_hit:
+                        ts_fail += 1
+                        # Turnstile failure: do NOT consume max_attempts
+                        log(
+                            f"[*] progress ok={ok}/{count} fail={fail} "
+                            f"ts_fail={ts_fail} attempts={attempts} "
+                            f"(turnstile fail ignored by max_attempts)"
+                        )
+                    else:
+                        counted_attempts += 1
+                        log(
+                            f"[*] progress ok={ok}/{count} fail={fail} "
+                            f"ts_fail={ts_fail} counted={counted_attempts}/{cap} "
+                            f"attempts={attempts}"
+                        )
             if on_result is not None:
                 try:
                     on_result(res)
                 except Exception:
                     pass
-            # stop extra workers quickly once target reached
             with results_lock:
-                if ok >= count or attempts >= max_attempts:
+                if ok >= count:
+                    return
+                if max_attempts > 0 and counted_attempts >= max_attempts:
                     return
 
     workers: list[threading.Thread] = []
@@ -871,14 +992,15 @@ def run_batch(
         t.join()
 
     _cleanup_browsers(cfg, log=log)
+    cap = str(max_attempts) if max_attempts > 0 else "∞"
     log(
-        f"\ndone ok={ok}/{count} fail={fail} attempts={attempts} "
-        f"max_attempts={max_attempts} | 并发={threads}"
+        f"\ndone ok={ok}/{count} fail={fail} ts_fail={ts_fail} "
+        f"attempts={attempts} counted={counted_attempts}/{cap} | 并发={threads}"
     )
-    if attempts >= max_attempts and ok < count:
+    if max_attempts > 0 and counted_attempts >= max_attempts and ok < count:
         log(
-            f"[!] 已达尝试上限 max_attempts={max_attempts}，"
-            f"成功 {ok}/{count}。可用 config.register_max_attempts 调整。"
+            f"[!] 非 Turnstile 尝试已达上限 max_attempts={max_attempts}，"
+            f"成功 {ok}/{count}。Turnstile 失败不计入该上限。"
         )
     return 0 if ok >= count else 1
 

@@ -1,11 +1,21 @@
-# 敏感文件
+# 敏感文件 / 本地密钥与运行数据（禁止入库）
 config.json
 accounts.json
 proxies.txt
 proxy_blacklist.json
+flclash_multiport.yaml
+flclash_multiport.candidates.txt
+.mihomo/
+_cleanup_local_only_cpa.py
+cpa_reactivate.json
+cpa_auths_local_only_deleted.txt
+cpa_reactivate_need.log
+cpa_reactivate_all.log
 
-# CPA 导出
+# CPA 导出与账号物料
 cpa_auths/
+*.sso
+*.cookie
 
 # Python
 __pycache__/
@@ -18,5 +28,6 @@ __pycache__/
 .env
 .env.*
 
-# 日志
+# 日志与本地报告
 *.log
+*.log.*

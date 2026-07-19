@@ -9,6 +9,7 @@ from curl_cffi import requests as cf_requests
 
 from proto_codec import (
     build_create_email_validation_code,
+    build_create_session_request,
     build_create_user_and_session,
     build_set_tos_accepted_version,
     build_verify_email_validation_code,
@@ -175,6 +176,46 @@ class AuthClient:
             self.log(f"[auth] {method} unavailable, fallback CreateUserAndSession")
             result = self.rpc("CreateUserAndSession", msg)
         return self.require_ok(result, "CreateUserAndSession")
+
+    def create_session(
+        self,
+        *,
+        email: str,
+        password: str,
+        turnstile_token: str = "",
+        castle_request_token: str = "",
+        tos_version: int | None = None,
+        use_v2: bool = True,
+    ) -> dict:
+        """Sign-in existing user (email/password + Turnstile). Browser only solves CF.
+
+        RPC: CreateSession / CreateSessionV2
+        Returns parsed grpc-web result; SSO is in cookies or frames.session_cookie.
+        """
+        msg = build_create_session_request(
+            email=email,
+            password=password,
+            turnstile_token=turnstile_token,
+            castle_request_token=castle_request_token,
+            tos_version=tos_version,
+        )
+        referer = f"{ACCOUNTS_BASE}/sign-in?redirect=grok-com"
+        method = "CreateSessionV2" if use_v2 else "CreateSession"
+        result = self.rpc(method, msg, referer=referer)
+        if str(result.get("status")) in {"12", "5"} and use_v2:
+            self.log(f"[auth] {method} unavailable, fallback CreateSession")
+            result = self.rpc("CreateSession", msg, referer=referer)
+        return self.require_ok(result, "CreateSession")
+
+    def warm_sign_in(self, redirect: str = "grok-com") -> None:
+        url = f"{ACCOUNTS_BASE}/sign-in?redirect={redirect}"
+        try:
+            r = self.session.get(url, proxies=self.proxies, timeout=self.timeout)
+        except Exception as exc:
+            raise RuntimeError(f"auth warm sign-in proxy/network error: {exc}") from exc
+        self.log(
+            f"[auth] warm sign-in {r.status_code} cookies={list(self.session.cookies.keys())}"
+        )
 
     def set_tos_accepted_version(self, version: int = 1) -> dict:
         msg = build_set_tos_accepted_version(version)

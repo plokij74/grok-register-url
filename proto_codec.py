@@ -248,6 +248,49 @@ def build_create_user_and_session(
     return msg
 
 
+def build_email_and_password_request(*, email: str, password: str) -> bytes:
+    """CreateSessionRequest.EmailAndPasswordRequest: email=1, clear_text_password=2."""
+    return encode_string(1, email) + encode_string(2, password)
+
+
+def build_create_session_credentials_email_password(
+    *, email: str, password: str
+) -> bytes:
+    """CreateSessionRequest.Credentials oneof email_and_password=1."""
+    return encode_message(1, build_email_and_password_request(email=email, password=password))
+
+
+def build_create_session_request(
+    *,
+    email: str,
+    password: str,
+    turnstile_token: str = "",
+    castle_request_token: str = "",
+    tos_version: int | None = None,
+    num_one_time_links: int | None = None,
+) -> bytes:
+    """CreateSessionRequest (auth_mgmt.proto):
+
+      credentials=1 (EmailAndPassword),
+      anti_abuse_token=4,
+      num_one_time_links=5,
+      tos_version=6,
+      castle_request_token=10
+    """
+    msg = encode_message(
+        1, build_create_session_credentials_email_password(email=email, password=password)
+    )
+    if turnstile_token:
+        msg += encode_message(4, build_anti_abuse_token(turnstile_token))
+    if num_one_time_links is not None:
+        msg += encode_varint_field(5, int(num_one_time_links))
+    if tos_version is not None:
+        msg += encode_varint_field(6, int(tos_version))
+    if castle_request_token:
+        msg += encode_string(10, castle_request_token)
+    return msg
+
+
 def build_set_tos_accepted_version(version: int = 1) -> bytes:
     """SetTosAcceptedVersionRequest — production code uses field 2 = version."""
     return encode_varint_field(2, int(version))

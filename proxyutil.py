@@ -195,6 +195,7 @@ def normalize_proxy_url(raw: Any) -> str:
       host:port
       user:pass@host:port
       host:port:user:pass   (711-style)
+      url  # inline comment   (comment stripped)
 
     Important: curl_cffi + local DNS (plain socks5://) often fails TLS to
     accounts.x.ai on residential SOCKS (curl 35 OPENSSL_internal). socks5h
@@ -203,6 +204,11 @@ def normalize_proxy_url(raw: Any) -> str:
     """
     p = (str(raw) if raw is not None else "").strip()
     if not p or p.startswith("#"):
+        return ""
+    # strip inline comments: "http://127.0.0.1:7890  # note"
+    if " #" in p:
+        p = p.split(" #", 1)[0].strip()
+    elif p.startswith("#"):
         return ""
     if "://" in p:
         # socks5 → socks5h so curl does remote DNS (fixes TLS to CF sites)
@@ -284,14 +290,50 @@ def _parse_proxy_list(raw_list: Any) -> list[str]:
     return out
 
 
+def _proxy_mode(config: dict[str, Any]) -> str:
+    """Normalized proxy mode: clash | multi | direct | auto.
+
+    - clash: only config.proxy (e.g. FlClash 127.0.0.1:7890)
+    - multi: proxies / Roxy manager / proxies.txt pool
+    - direct: no proxy
+    - auto: legacy behavior (pool if any, else single proxy)
+    """
+    if not config.get("use_proxy", True):
+        return "direct"
+    raw = str(config.get("proxy_mode") or "auto").strip().lower()
+    if raw in ("clash", "single", "flclash", "local", "1"):
+        return "clash"
+    if raw in ("multi", "pool", "multiport", "proxies", "2"):
+        return "multi"
+    if raw in ("direct", "off", "none", "3"):
+        return "direct"
+    return "auto"
+
+
 def load_proxy_pool(cfg: dict[str, Any] | None = None, *, log: LogFn | None = None) -> list[str]:
-    """Load proxy pool (fallback to local single proxy only when empty)."""
+    """Load proxy pool (fallback to local single proxy only when empty).
+
+    Honors config.proxy_mode:
+      clash  → only config.proxy (ignore proxies.txt multi list)
+      multi  → proxies / Roxy / proxies_file / proxy fallback
+      direct → empty
+      auto   → multi-style load (legacy)
+    """
     config = cfg if cfg is not None else _cfg()
     log = log or (lambda m: print(m, flush=True))
 
-    if not config.get("use_proxy", True):
+    mode = _proxy_mode(config)
+    if mode == "direct":
         return []
 
+    if mode == "clash":
+        single = normalize_proxy_url(config.get("proxy", ""))
+        if single:
+            return [single]
+        log("[!] proxy_mode=clash 但 config.proxy 为空")
+        return []
+
+    # multi / auto
     # 1) explicit list
     pool = _parse_proxy_list(config.get("proxies") or [])
     if pool:
